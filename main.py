@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Простой Telegram Gift Detector Bot для развертывания на бесплатных платформах
+Простой Telegram Gift Detector Bot
+Работает на python-telegram-bot v20.3
 """
 
 import asyncio
@@ -8,10 +9,6 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Dict, Any
-
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,6 +17,7 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
 
 class SimpleGiftBot:
     def __init__(self):
@@ -42,7 +40,7 @@ class SimpleGiftBot:
         
         logger.info(f"Bot initialized for user {self.target_user_id}")
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def start_command(self, update, context) -> None:
         """Команда /start"""
         await update.message.reply_text(
             "🎁 Бот мониторинга подарков запущен!\n\n"
@@ -55,7 +53,7 @@ class SimpleGiftBot:
         )
         logger.info(f"Пользователь {update.effective_user.id} запустил бота")
 
-    async def stop_spam_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def stop_spam_command(self, update, context) -> None:
         """Команда /stop_spam"""
         if self.spam_active and self.spam_task:
             self.spam_active = False
@@ -66,7 +64,7 @@ class SimpleGiftBot:
         else:
             await update.message.reply_text("ℹ️ Спам сейчас не активен")
 
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def status_command(self, update, context) -> None:
         """Команда /status"""
         status = "🔴 Неактивен" if not self.spam_active else "🟢 Активен"
         await update.message.reply_text(
@@ -78,7 +76,7 @@ class SimpleGiftBot:
             f"Интенсивность: {self.spam_intensity} сообщений"
         )
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def help_command(self, update, context) -> None:
         """Команда /help"""
         await update.message.reply_text(
             "🆘 Помощь по боту мониторинга подарков\n\n"
@@ -95,7 +93,7 @@ class SimpleGiftBot:
             "⚙️ Бот работает 24/7 и мониторит все сообщения!"
         )
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_message(self, update, context) -> None:
         """Обработка сообщений для поиска подарков"""
         if not update.message or not update.message.text:
             return
@@ -120,7 +118,7 @@ class SimpleGiftBot:
                     await self.start_spam_notifications(context.bot, update.message.text)
                 break
 
-    async def start_spam_notifications(self, bot: Bot, original_message: str) -> None:
+    async def start_spam_notifications(self, bot, original_message: str) -> None:
         """Запуск спам-уведомлений"""
         if self.spam_active:
             return
@@ -133,7 +131,7 @@ class SimpleGiftBot:
             self.spam_worker(bot, original_message)
         )
 
-    async def spam_worker(self, bot: Bot, original_message: str) -> None:
+    async def spam_worker(self, bot, original_message: str) -> None:
         """Рабочий процесс спама"""
         start_time = datetime.now()
         messages_sent = 0
@@ -187,6 +185,8 @@ class SimpleGiftBot:
     async def run(self):
         """Запуск бота"""
         try:
+            from telegram.ext import Application, CommandHandler, MessageHandler, filters
+            
             # Создание приложения
             self.application = Application.builder().token(self.bot_token).build()
             
@@ -206,16 +206,14 @@ class SimpleGiftBot:
             
             # Запуск бота
             await self.application.run_polling(
-                poll_interval=1.0,
-                timeout=20,
-                read_timeout=20,
-                write_timeout=20,
-                connect_timeout=20
+                allowed_updates=["message"],
+                drop_pending_updates=True
             )
             
         except Exception as e:
             logger.error(f"Ошибка запуска бота: {e}")
             raise
+
 
 async def main():
     """Главная функция"""
@@ -227,6 +225,7 @@ async def main():
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
