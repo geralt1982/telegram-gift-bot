@@ -1,279 +1,210 @@
 #!/usr/bin/env python3
+"""
+Простой Telegram Gift Detector Bot для развертывания на бесплатных платформах
+"""
+
 import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Dict, Any
 
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)]
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-try:
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-    from telegram import Update, Bot
-    from telegram.error import TelegramError
-except ImportError as e:
-    logger.error(f"Ошибка импорта telegram: {e}")
-    sys.exit(1)
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 class SimpleGiftBot:
     def __init__(self):
-        self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-        self.TARGET_USER_ID = int(os.getenv("TARGET_USER_ID", "0"))
-        self.MONITOR_GROUP = os.getenv("MONITOR_GROUP", "gifts_detector")
-        self.GIFT_TRIGGER_TEXT = os.getenv("GIFT_TRIGGER_TEXT", "🔥 A new limited gift has appeared")
-        self.SPAM_INTERVAL = float(os.getenv("SPAM_INTERVAL", "3.0"))
-        self.SPAM_DURATION = int(os.getenv("SPAM_DURATION", "300"))
-        self.SPAM_INTENSITY = int(os.getenv("SPAM_INTENSITY", "5"))
+        # Получение переменных среды
+        self.bot_token = os.getenv('BOT_TOKEN')
+        self.target_user_id = int(os.getenv('TARGET_USER_ID', '0'))
         
-        if not self.BOT_TOKEN or not self.TARGET_USER_ID:
-            logger.error("BOT_TOKEN или TARGET_USER_ID не найдены!")
-            sys.exit(1)
-            
+        if not self.bot_token or not self.target_user_id:
+            raise ValueError("BOT_TOKEN и TARGET_USER_ID должны быть установлены!")
+        
+        # Настройки спама
+        self.spam_interval = float(os.getenv('SPAM_INTERVAL', '3.0'))
+        self.spam_duration = int(os.getenv('SPAM_DURATION', '300'))
+        self.spam_intensity = int(os.getenv('SPAM_INTENSITY', '5'))
+        
+        # Состояние бота
+        self.spam_active = False
+        self.spam_task = None
         self.application = None
-        self.active_spam_tasks = {}
-        self.messages_processed = 0
-        self.gifts_detected = 0
-        self.start_time = datetime.now()
         
+        logger.info(f"Bot initialized for user {self.target_user_id}")
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        welcome_message = f"""
-🎁 Gift Detector Bot активен!
+        """Команда /start"""
+        await update.message.reply_text(
+            "🎁 Бот мониторинга подарков запущен!\n\n"
+            "Теперь я слежу за сообщениями о подарках и буду будить вас агрессивными уведомлениями!\n\n"
+            "Команды:\n"
+            "/start - Запуск бота\n"
+            "/stop_spam - Остановить спам\n"
+            "/status - Статус бота\n"
+            "/help - Помощь"
+        )
+        logger.info(f"Пользователь {update.effective_user.id} запустил бота")
 
-Мониторю группу {self.MONITOR_GROUP} для обнаружения подарков.
-Когда найду сообщение с "{self.GIFT_TRIGGER_TEXT}", начну спам-уведомления!
-
-Команды:
-• /start - Показать это сообщение
-• /stop_spam - Остановить спам
-• /status - Статус бота
-• /help - Помощь
-
-Настройки:
-• Пользователь: {self.TARGET_USER_ID}
-• Интервал спама: {self.SPAM_INTERVAL}с
-• Длительность: {self.SPAM_DURATION}с
-• Интенсивность: {self.SPAM_INTENSITY} сообщений
-
-Бот готов к работе! 🚀
-        """
-        await update.message.reply_text(welcome_message)
-        
     async def stop_spam_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        
-        if user_id == self.TARGET_USER_ID:
-            stopped_count = 0
-            for task_user_id in list(self.active_spam_tasks.keys()):
-                task = self.active_spam_tasks[task_user_id]
-                task.cancel()
-                del self.active_spam_tasks[task_user_id]
-                stopped_count += 1
-                
-            if stopped_count > 0:
-                await update.message.reply_text(f"✅ Спам остановлен! Остановлено {stopped_count} активных сессий.")
-            else:
-                await update.message.reply_text("ℹ️ Активных спам-сессий не найдено.")
+        """Команда /stop_spam"""
+        if self.spam_active and self.spam_task:
+            self.spam_active = False
+            self.spam_task.cancel()
+            self.spam_task = None
+            await update.message.reply_text("✅ Спам уведомления остановлены!")
+            logger.info("Спам остановлен по команде пользователя")
         else:
-            await update.message.reply_text("❌ У вас нет прав для остановки спама.")
-            
+            await update.message.reply_text("ℹ️ Спам сейчас не активен")
+
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        uptime = datetime.now() - self.start_time
-        uptime_str = str(uptime).split('.')[0]
-        active_spam_count = len(self.active_spam_tasks)
-        
-        status_message = f"""
-📊 Статус бота
+        """Команда /status"""
+        status = "🔴 Неактивен" if not self.spam_active else "🟢 Активен"
+        await update.message.reply_text(
+            f"📊 Статус бота:\n\n"
+            f"Спам: {status}\n"
+            f"Целевой пользователь: {self.target_user_id}\n"
+            f"Интервал: {self.spam_interval}с\n"
+            f"Длительность: {self.spam_duration}с\n"
+            f"Интенсивность: {self.spam_intensity} сообщений"
+        )
 
-Время работы: {uptime_str}
-Обработано сообщений: {self.messages_processed}
-Найдено подарков: {self.gifts_detected}
-Активных спам-сессий: {active_spam_count}
-
-Конфигурация:
-• Группа: {self.MONITOR_GROUP}
-• Пользователь: {self.TARGET_USER_ID}
-• Интервал: {self.SPAM_INTERVAL}с
-• Длительность: {self.SPAM_DURATION}с
-• Интенсивность: {self.SPAM_INTENSITY}
-
-Статус: {'🟢 Работает' if active_spam_count == 0 else '🟡 Активный спам'}
-
-Обновлено: {datetime.now().strftime('%H:%M:%S')}
-        """
-        await update.message.reply_text(status_message)
-        
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        help_message = f"""
-🆘 Помощь по Gift Detector Bot
+        """Команда /help"""
+        await update.message.reply_text(
+            "🆘 Помощь по боту мониторинга подарков\n\n"
+            "Этот бот следит за сообщениями о подарках в группах и отправляет агрессивные уведомления.\n\n"
+            "🔍 Триггеры для поиска подарков:\n"
+            "- '🔥 A new limited gift has appeared'\n"
+            "- 'подарок'\n"
+            "- 'gift'\n\n"
+            "📱 Команды:\n"
+            "/start - Запуск бота\n"
+            "/stop_spam - Остановить спам\n"
+            "/status - Показать статус\n"
+            "/help - Эта справка\n\n"
+            "⚙️ Бот работает 24/7 и мониторит все сообщения!"
+        )
 
-Назначение:
-Бот отслеживает группу {self.MONITOR_GROUP} и отправляет агрессивные уведомления при обнаружении подарков.
-
-Команды:
-• /start - Запуск и информация
-• /stop_spam - Остановить все уведомления
-• /status - Показать статус и статистику
-• /help - Эта справка
-
-Как работает:
-1. Бот мониторит сообщения в группе
-2. При обнаружении "{self.GIFT_TRIGGER_TEXT}" активируется спам
-3. Отправляются множественные уведомления каждые {self.SPAM_INTERVAL}с
-4. Спам длится до {self.SPAM_DURATION}с или до команды /stop_spam
-5. Каждая волна содержит {self.SPAM_INTENSITY} сообщений
-
-Удачной охоты за подарками! 🎁
-        """
-        await update.message.reply_text(help_message)
-        
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            message = update.message
-            if not message or not message.text:
-                return
-                
-            self.messages_processed += 1
+        """Обработка сообщений для поиска подарков"""
+        if not update.message or not update.message.text:
+            return
             
-            chat = message.chat
-            if not chat:
-                return
+        message_text = update.message.text.lower()
+        
+        # Триггеры для обнаружения подарков
+        gift_triggers = [
+            "🔥 a new limited gift has appeared",
+            "подарок",
+            "gift",
+            "🎁"
+        ]
+        
+        # Проверяем наличие триггеров
+        for trigger in gift_triggers:
+            if trigger in message_text:
+                logger.info(f"Обнаружен подарок! Триггер: '{trigger}' в сообщении: {message_text[:100]}")
                 
-            is_target_group = (
-                chat.username == self.MONITOR_GROUP or
-                chat.title == self.MONITOR_GROUP or
-                str(chat.id) == self.MONITOR_GROUP
-            )
-            
-            if not is_target_group:
-                return
-                
-            if message.text.startswith(self.GIFT_TRIGGER_TEXT):
-                self.gifts_detected += 1
-                logger.info(f"🎁 ПОДАРОК НАЙДЕН! Сообщение: {message.text[:100]}...")
-                await self.start_spam_notifications(context.bot, message.text)
-                
-        except Exception as e:
-            logger.error(f"Ошибка обработки сообщения: {e}")
-            
+                # Запускаем спам уведомления
+                if not self.spam_active:
+                    await self.start_spam_notifications(context.bot, update.message.text)
+                break
+
     async def start_spam_notifications(self, bot: Bot, original_message: str) -> None:
-        try:
-            if self.TARGET_USER_ID in self.active_spam_tasks:
-                self.active_spam_tasks[self.TARGET_USER_ID].cancel()
-                
-            task = asyncio.create_task(self.spam_worker(bot, original_message))
-            self.active_spam_tasks[self.TARGET_USER_ID] = task
+        """Запуск спам-уведомлений"""
+        if self.spam_active:
+            return
             
-        except Exception as e:
-            logger.error(f"Ошибка запуска спама: {e}")
-            
+        self.spam_active = True
+        logger.info("Запуск агрессивных уведомлений о подарке!")
+        
+        # Запускаем задачу спама
+        self.spam_task = asyncio.create_task(
+            self.spam_worker(bot, original_message)
+        )
+
     async def spam_worker(self, bot: Bot, original_message: str) -> None:
+        """Рабочий процесс спама"""
+        start_time = datetime.now()
+        messages_sent = 0
+        
         try:
-            start_time = datetime.now()
-            end_time = start_time + timedelta(seconds=self.SPAM_DURATION)
-            
-            alert_message = f"""
-🚨 ПОДАРОК ОБНАРУЖЕН! ПРОСЫПАЙСЯ! 🚨
-
-🎁 В группе gifts_detector появился новый подарок!
-
-Сообщение:
-{original_message}
-
-Время: {start_time.strftime('%H:%M:%S')}
-
-Используй /stop_spam чтобы остановить уведомления.
-            """
-            
-            await bot.send_message(
-                chat_id=self.TARGET_USER_ID,
-                text=alert_message
-            )
-            
-            message_count = 0
-            spam_messages = [
-                "🚨 ПРОСЫПАЙСЯ! Подарок #{} обнаружен!",
-                "⏰ НЕ ПРОПУСТИ! Уведомление #{}",
-                "🎁 ПОДАРОК ДОСТУПЕН! Сообщение #{}",
-                "🔥 СРОЧНО: Лимитированный подарок #{}",
-                "⚡ ПРОСНИСЬ! Подарок #{} найден!",
-                "🚀 БЫСТРЕЕ! Уведомление #{}",
-                "💥 ВНИМАНИЕ! Подарок #{} детектирован!",
-                "🎯 ПРОСНИСЬ! Важный подарок #{}"
-            ]
-            
-            while datetime.now() < end_time:
-                try:
-                    for i in range(self.SPAM_INTENSITY):
-                        message_count += 1
-                        message_text = spam_messages[message_count % len(spam_messages)].format(message_count)
+            while self.spam_active:
+                # Проверяем лимит времени
+                elapsed = (datetime.now() - start_time).total_seconds()
+                if elapsed >= self.spam_duration:
+                    logger.info(f"Спам завершен по времени ({self.spam_duration}с)")
+                    break
+                
+                # Отправляем пакет сообщений
+                for i in range(self.spam_intensity):
+                    if not self.spam_active:
+                        break
                         
-                        await bot.send_message(
-                            chat_id=self.TARGET_USER_ID,
-                            text=message_text
+                    try:
+                        message = (
+                            f"🚨 ПОДАРОК ОБНАРУЖЕН! 🚨\n\n"
+                            f"⏰ {datetime.now().strftime('%H:%M:%S')}\n\n"
+                            f"📝 Исходное сообщение:\n{original_message[:200]}...\n\n"
+                            f"🔥 БЫСТРЕЕ! НЕ ПРОСПИ ПОДАРОК!\n\n"
+                            f"📊 Сообщение #{messages_sent + 1}"
                         )
                         
+                        await bot.send_message(
+                            chat_id=self.target_user_id,
+                            text=message
+                        )
+                        messages_sent += 1
+                        
+                        # Небольшая пауза между сообщениями в пакете
                         await asyncio.sleep(0.5)
                         
-                    await asyncio.sleep(self.SPAM_INTERVAL)
-                    
-                except TelegramError as e:
-                    logger.error(f"Ошибка отправки спама: {e}")
-                    await asyncio.sleep(2)
-                    
-                except asyncio.CancelledError:
-                    logger.info("Спам-задача отменена")
-                    break
-                    
-            if self.TARGET_USER_ID in self.active_spam_tasks:
-                final_message = f"""
-✅ Спам-сессия завершена
-
-Сводка:
-• Длительность: {self.SPAM_DURATION} секунд
-• Отправлено сообщений: {message_count}
-• Завершено: {datetime.now().strftime('%H:%M:%S')}
-
-Надеюсь, ты проснулся! Используй /stop_spam для остановки будущих уведомлений.
-                """
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки сообщения: {e}")
                 
-                await bot.send_message(
-                    chat_id=self.TARGET_USER_ID,
-                    text=final_message
-                )
+                # Пауза между пакетами
+                await asyncio.sleep(self.spam_interval)
                 
+        except asyncio.CancelledError:
+            logger.info("Задача спама была отменена")
         except Exception as e:
-            logger.error(f"Ошибка в спам-воркере: {e}")
-            
+            logger.error(f"Ошибка в spam_worker: {e}")
         finally:
-            if self.TARGET_USER_ID in self.active_spam_tasks:
-                del self.active_spam_tasks[self.TARGET_USER_ID]
-                
+            self.spam_active = False
+            self.spam_task = None
+            logger.info(f"Спам завершен. Отправлено сообщений: {messages_sent}")
+
     async def run(self):
+        """Запуск бота"""
         try:
-            self.application = Application.builder().token(self.BOT_TOKEN).build()
+            # Создание приложения
+            self.application = Application.builder().token(self.bot_token).build()
             
+            # Добавление обработчиков
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CommandHandler("stop_spam", self.stop_spam_command))
             self.application.add_handler(CommandHandler("status", self.status_command))
             self.application.add_handler(CommandHandler("help", self.help_command))
             
+            # Обработчик всех текстовых сообщений
             self.application.add_handler(MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                filters.TEXT & ~filters.COMMAND, 
                 self.handle_message
             ))
             
-            logger.info("🚀 Запуск Gift Detector Bot...")
+            logger.info("Запуск бота...")
+            
+            # Запуск бота
             await self.application.run_polling(
                 poll_interval=1.0,
                 timeout=20,
@@ -287,9 +218,9 @@ class SimpleGiftBot:
             raise
 
 async def main():
-    bot = SimpleGiftBot()
-    
+    """Главная функция"""
     try:
+        bot = SimpleGiftBot()
         await bot.run()
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
